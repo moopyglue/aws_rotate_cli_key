@@ -118,7 +118,7 @@ agevalue="$( cat $TMP.prelist | awk -F'\t' -v myid=${originalid} '$2==myid { pri
 ageinsecs="$(( $( period_in_secs now ) - $( period_in_secs "$agevalue") ))"
 debug "identity=$originalid ageinsecs=$ageinsecs"
 
-# list keys
+# list keys if requested
 if [[ $list_keys == yes ]] ; then
 	cat $TMP.prelist | awk -F'\t' -v myid=${originalid} '
 		$2==myid { print $2 " " $3 " " $4 " " $5 " (current)" }
@@ -199,5 +199,15 @@ debug removing old key and backup file
 aws iam delete-access-key --access-key-id "$originalid" 
 [[ $? == 0 ]] || fatal 101 "failed to clean up and delete original key - messy"
 rm $HOME/.aws/credentials.backup
+
+# list keys if requested
+if [[ $list_keys == yes ]] ; then
+	aws iam list-access-keys --output text > $TMP.postlist
+	[[ $? == 0 ]] || fatal 101 "error getting iam access keys to list status"
+	cat $TMP.postlist | awk -F'\t' -v myid=${newkeyid} '
+		$2==myid { print $2 " " $3 " " $4 " " $5 " (current)" }
+		$2!=myid { print $2 " " $3 " " $4 " " $5 }
+	'
+fi
 
 exit 0
