@@ -1,6 +1,7 @@
 #!/bin/env bash
 
-TMP=/tmp/rotate.$$
+codename=rotate_aws_access_key
+TMP=/tmp/${codename}.$$
 trap "rm $TMP.* 2>/dev/null" EXIT
 debug_flag=off
 
@@ -47,17 +48,34 @@ function fatal () {
 }
 
 function error() {
-	echo "rotate: $@" 1>&2
+	echo "${codename}: $@" 1>&2
 }
 
 function helpinfo() {
-	error "$@"
+	[[ "$@" == "" ]] || error "$@"
 	cat <<!! | sed -e 's/.//' -e 1d
 
-	this is the help information 
-	put instructions here
-	TODO
-	
+	usage:-
+
+		${codename} help                this help information
+		${codename} now                 rotate keys now
+		${codename} every <period>      rotate key if they are more than <period> old
+		${codename} list                list the current registered keys
+
+	modifers :-
+		debug   enables additional debugging output
+		force   forces cycle even if there are 2 existiing keys or an in-use backup
+		nolog   will not write log entries to ~/.${codename}.log
+
+	<period> value must be a single parameter so if contains a space needs quotes
+
+		10days "15 days" 1hour "1 minute" 24 hours
+
+	e.g
+		${codename} every 20days debug force
+		${codename} every 24hours 
+		${codename} now nolog
+
 !!
 	exit
 }
@@ -68,14 +86,14 @@ function helpinfo() {
 # general checks
 aws_cli_available=$(aws --version 2>/dev/null | grep "^aws-cli" | wc -l)
 [[ $aws_cli_available != 1 ]] && fatal 100 "AWS CLI is not installed or not in PATH"
-[[ -f $HOME/.aws/credentials ]] || ftala 100 "Credentials files not where expected"
+[[ -f $HOME/.aws/credentials ]] || fatal 101 "Credentials files not where expected"
 
 # review parameters and set up any needed variables
 period=""
 declare -A used_params
 while [[ "$@" != "" ]] ; do
 
-	[[ ${used_params[$1]} != "" ]] && fatal 1 "parameter cannot be delcared twice : $1"
+	[[ ${used_params[$1]} != "" ]] && fatal 102 "parameter cannot be delcared twice : $1"
 	used_params[$1]="used"
 
 	case $1 in
@@ -84,13 +102,14 @@ while [[ "$@" != "" ]] ; do
 		help) helpinfo	;;
 		list) list_keys=yes ;;
 		force) force_rotate=yes ;;
-		now) period=now ;; 
+		now) period=$1 ;; 
 		every) shift ; period="$1" ;;
 		*) helpinfo "invalid command line option used - $1"  ;;
 	esac
 	shift
 
 done
+[[ ${#used_params[@]} == 0 ]] && helpinfo 
 
 # check out period of rotation
 if [[ $period == "" ]] ; then
@@ -106,13 +125,13 @@ fi
 
 # get active keys
 aws iam list-access-keys --output text > $TMP.prelist
-[[ $? == 0 ]] || fatal 101 "error getting iam access keys - exiting"
+[[ $? == 0 ]] || fatal 121 "error getting iam access keys - exiting"
 cat $TMP.prelist | debug
 keycount=$( cat $TMP.prelist | wc -l )
 
 # get current identity
 aws configure get aws_access_key_id > $TMP.identity
-[[ $? == 0 ]] || fatal 101 "error getting key identity - exiting"
+[[ $? == 0 ]] || fatal 122 "error getting key identity - exiting"
 originalid=$( cat $TMP.identity)
 agevalue="$( cat $TMP.prelist | awk -F'\t' -v myid=${originalid} '$2==myid { print $3 }')"
 ageinsecs="$(( $( period_in_secs now ) - $( period_in_secs "$agevalue") ))"
@@ -138,22 +157,22 @@ if [[ $keycount == 2 ]] ; then
 	notinuse="$(cat $TMP.prelist | awk -F'\t' -v myid=${originalid} '$2 != myid { print $2 }')"
 	if [[ $force_rotate == yes ]] ;then
 		aws iam delete-access-key --access-key-id "$notinuse" 
-		[[ $? == 0 ]] || fatal 101 "failed to delete not-in-use key - $notinuse"
+		[[ $? == 0 ]] || fatal 123 "failed to delete not-in-use key - $notinuse"
 		echo deleted extra unneeded key "$notinuse" 
 	else
-		fatal 102 "2 active keys - use 'force' to delete non-current key - $notinuse"
+		fatal 124 "2 active keys - use 'force' to delete non-current key - $notinuse"
 	fi
 fi
 
 # backup old key - if exists 
-[[ $force_rotate != yes && -f $HOME/.aws/credentials.backup ]] && fatal 101 "existing credentials backup file - use 'force' to override" 
+[[ $force_rotate != yes && -f $HOME/.aws/credentials.backup ]] && fatal 125 "existing credentials backup file - use 'force' to override" 
 cp -p $HOME/.aws/credentials $HOME/.aws/credentials.backup
-[[ $? == 0 ]] || fatal 101 "unable to backup current key - unsafe to proceed"
+[[ $? == 0 ]] || fatal 126 "unable to backup current key - unsafe to proceed"
 debug backup file created $HOME/.aws/credentials.backu
 
 # create new key
 newkey=$( aws iam create-access-key --output text | awk -F'\t' '$1=="ACCESSKEY" { print $2 " " $4 }')
-[[ $newkey == "" ]] && fatal 101 "error creating new key - unsafe to proceed"
+[[ $newkey == "" ]] && fatal 130 "error creating new key - unsafe to proceed"
 debug "new key created"
 export AWS_SECRET_ACCESS_KEY=${newkey##* }
 export AWS_ACCESS_KEY_ID=${newkey% $AWS_SECRET_ACCESS_KEY}
@@ -176,34 +195,34 @@ unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
 if [[ $status != 0 ]] ; then
 	error "newly created key testing timed out after $totalsleep secconds - deleting new key using original key"
 	aws iam delete-access-key --access-key-id "$newkeyid"
-	fatal 101 "key rotate failed"
+	fatal 131 "key rotate failed"
 fi
 debug "new key worked"
 
 # install new key 
 aws configure set aws_access_key_id $newkeyid
-[[ $? == 0 ]] || fatal 101 "unable to configure new key id - unsafe to proceed"
+[[ $? == 0 ]] || fatal 132 "unable to configure new key id - unsafe to proceed"
 aws configure set aws_secret_access_key $newsecret
-[[ $? == 0 ]] || fatal 101 "unable to configure new key secret - unsafe to proceed"
+[[ $? == 0 ]] || fatal 133 "unable to configure new key secret - unsafe to proceed"
 aws iam list-access-keys --output text > $TMP.midlist
 if [[ $? != 0 ]] ; then
 	error "error installing new key - revering to original key"
 	# restore original credentials
 	mv $HOME/.aws/credentials.backup $HOME/.aws/credentials
-	fatal 101 "key rotate failed"
+	fatal 134 "key rotate failed"
 fi
 echo "Successfully created+tested+installed new key $newkeyid"
 
 # remove original key using new key
 debug removing old key and backup file
 aws iam delete-access-key --access-key-id "$originalid" 
-[[ $? == 0 ]] || fatal 101 "failed to clean up and delete original key - messy"
+[[ $? == 0 ]] || fatal 140 "failed to clean up and delete original key - messy"
 rm $HOME/.aws/credentials.backup
 
 # list keys if requested
 if [[ $list_keys == yes ]] ; then
 	aws iam list-access-keys --output text > $TMP.postlist
-	[[ $? == 0 ]] || fatal 101 "error getting iam access keys to list status"
+	[[ $? == 0 ]] || fatal 150 "error getting iam access keys to list status"
 	cat $TMP.postlist | awk -F'\t' -v myid=${newkeyid} '
 		$2==myid { print $2 " " $3 " " $4 " " $5 " (current)" }
 		$2!=myid { print $2 " " $3 " " $4 " " $5 }
