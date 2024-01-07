@@ -1,0 +1,203 @@
+#!/bin/env bash
+
+TMP=/tmp/rotate.$$
+trap "rm $TMP.* 2>/dev/null" EXIT
+debug_flag=off
+
+
+# FUNCTIONS
+# ====================================================================
+
+# period_in_secs()
+# given "now" returns 0
+# given "10mins" "10 mins" returns 600
+# given "20days" returns 1728000
+function period_in_secs() {
+	
+	local nano_in_sec=1000000000
+	local dt=$( /bin/date --date "$1" +"%s%N" 2>/dev/null )
+	local now=$( /bin/date +"%s%N" )
+    # NOTE: "%s%N" formats date as EPOC time in Nano Seconds
+	
+	if [[ $dt == "" ]] ; then
+		false
+	else
+		echo "$(( (( $dt - $now )+($nano_in_sec/2))/$nano_in_sec  ))"
+		true
+	fi
+}
+
+# logging and helper routines
+
+function debug () {
+
+	if [[ $debug_flag == "on" ]] ; then
+		if [[ "$@" != "" ]] ; then
+			echo "DEBUG: $@" 1>&2
+		else
+			cat | sed 's/^/DEBUG: /'
+		fi
+	fi
+}
+
+function fatal () {
+	local errcode=$1 ; shift
+	error "FATAL:" "$@"
+	exit $errcode
+}
+
+function error() {
+	echo "rotate: $@" 1>&2
+}
+
+function helpinfo() {
+	error "$@"
+	cat <<!! | sed -e 's/.//' -e 1d
+
+	this is the help information 
+	put instructions here
+	TODO
+	
+!!
+	exit
+}
+
+# MAIN
+# ====================================================================
+
+# general checks
+aws_cli_available=$(aws --version 2>/dev/null | grep "^aws-cli" | wc -l)
+[[ $aws_cli_available != 1 ]] && fatal 100 "AWS CLI is not installed or not in PATH"
+[[ -f $HOME/.aws/credentials ]] || ftala 100 "Credentials files not where expected"
+
+# review parameters and set up any needed variables
+period=""
+declare -A used_params
+while [[ "$@" != "" ]] ; do
+
+	[[ ${used_params[$1]} != "" ]] && fatal 1 "parameter cannot be delcared twice : $1"
+	used_params[$1]="used"
+
+	case $1 in
+		debug) debug_flag=on ; debug debugging enabled from command line ;;
+		nolog) echo no logging ;;
+		help) helpinfo	;;
+		list) list_keys=yes ;;
+		force) force_rotate=yes ;;
+		now) period=now ;; 
+		every) shift ; period="$1" ;;
+		*) helpinfo "invalid command line option used - $1"  ;;
+	esac
+	shift
+
+done
+
+# check out period of rotation
+if [[ $period == "" ]] ; then
+	[[ $force_rotate == yes ]] && fatal 103 "cannot use 'force' when not rotating keys - use 'every xdays' or 'now'"
+else
+	# convert provided period into seconds
+	periodsecs="$( period_in_secs "$period" )"
+	[[ $? == 0 ]] || fatal 110 "error getting date period using value '$period'"
+	echo "$periodsecs" | grep "^-" > /dev/null
+	[[ $? == 0 ]] && fatal 111 "error NEGATVE date peroid provided : $periodsecs secs"
+	debug "seconds before rotation = $periodsecs"
+fi
+
+# get active keys
+aws iam list-access-keys --output text > $TMP.prelist
+[[ $? == 0 ]] || fatal 101 "error getting iam access keys - exiting"
+cat $TMP.prelist | debug
+keycount=$( cat $TMP.prelist | wc -l )
+
+# get current identity
+aws configure get aws_access_key_id > $TMP.identity
+[[ $? == 0 ]] || fatal 101 "error getting key identity - exiting"
+originalid=$( cat $TMP.identity)
+agevalue="$( cat $TMP.prelist | awk -F'\t' -v myid=${originalid} '$2==myid { print $3 }')"
+ageinsecs="$(( $( period_in_secs now ) - $( period_in_secs "$agevalue") ))"
+debug "identity=$originalid ageinsecs=$ageinsecs"
+
+# list keys
+if [[ $list_keys == yes ]] ; then
+	cat $TMP.prelist | awk -F'\t' -v myid=${originalid} '
+		$2==myid { print $2 " " $3 " " $4 " " $5 " (current)" }
+		$2!=myid { print $2 " " $3 " " $4 " " $5 }
+	'
+fi
+
+# stop here if no rotation requested or required
+[[ $period == "" ]] && exit 0
+if (( $ageinsecs < $periodsecs )) ; then
+	echo no rotation required, current key still within rotation period
+	exit 0
+fi
+
+# if more than 1 active key + force enabled then delete the other key
+if [[ $keycount == 2 ]] ; then
+	notinuse="$(cat $TMP.prelist | awk -F'\t' -v myid=${originalid} '$2 != myid { print $2 }')"
+	if [[ $force_rotate == yes ]] ;then
+		aws iam delete-access-key --access-key-id "$notinuse" 
+		[[ $? == 0 ]] || fatal 101 "failed to delete not-in-use key - $notinuse"
+		echo deleted extra unneeded key "$notinuse" 
+	else
+		fatal 102 "2 active keys - use 'force' to delete non-current key - $notinuse"
+	fi
+fi
+
+# backup old key - if exists 
+[[ $force_rotate != yes && -f $HOME/.aws/credentials.backup ]] && fatal 101 "existing credentials backup file - use 'force' to override" 
+cp -p $HOME/.aws/credentials $HOME/.aws/credentials.backup
+[[ $? == 0 ]] || fatal 101 "unable to backup current key - unsafe to proceed"
+debug backup file created $HOME/.aws/credentials.backu
+
+# create new key
+newkey=$( aws iam create-access-key --output text | awk -F'\t' '$1=="ACCESSKEY" { print $2 " " $4 }')
+[[ $newkey == "" ]] && fatal 101 "error creating new key - unsafe to proceed"
+debug "new key created"
+export AWS_SECRET_ACCESS_KEY=${newkey##* }
+export AWS_ACCESS_KEY_ID=${newkey% $AWS_SECRET_ACCESS_KEY}
+export AWS_SESSION_TOKEN=""
+
+# test new key until success or give up
+debug testing new key until active
+totalsleep=0
+for sleep in 1 1 2 2 4 4 8 8 16 16 0; do
+	aws iam list-access-keys --output text > /dev/null 2> $TMP.err
+	status=$?
+	[[ $status == 0 ]] && break
+	cat $TMP.err | sed '/^$/d' | debug
+	sleep $sleep
+	totalsleep=$(( $totalsleep + $sleep ))
+done
+newkeyid=$AWS_ACCESS_KEY_ID
+newsecret=$AWS_SECRET_ACCESS_KEY
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+if [[ $status != 0 ]] ; then
+	error "newly created key testing timed out after $totalsleep secconds - deleting new key using original key"
+	aws iam delete-access-key --access-key-id "$newkeyid"
+	fatal 101 "key rotate failed"
+fi
+debug "new key worked"
+
+# install new key 
+aws configure set aws_access_key_id $newkeyid
+[[ $? == 0 ]] || fatal 101 "unable to configure new key id - unsafe to proceed"
+aws configure set aws_secret_access_key $newsecret
+[[ $? == 0 ]] || fatal 101 "unable to configure new key secret - unsafe to proceed"
+aws iam list-access-keys --output text > $TMP.midlist
+if [[ $? != 0 ]] ; then
+	error "error installing new key - revering to original key"
+	# restore original credentials
+	mv $HOME/.aws/credentials.backup $HOME/.aws/credentials
+	fatal 101 "key rotate failed"
+fi
+echo "Successfully created+tested+installed new key $newkeyid"
+
+# remove original key using new key
+debug removing old key and backup file
+aws iam delete-access-key --access-key-id "$originalid" 
+[[ $? == 0 ]] || fatal 101 "failed to clean up and delete original key - messy"
+rm $HOME/.aws/credentials.backup
+
+exit 0
